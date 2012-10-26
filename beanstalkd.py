@@ -2,8 +2,7 @@
 # Plugin to collectd statistics from beanstalkd
 #
 
-import collectd
-from beanstalkc import Connection
+import collectd, socket
 
 class Beanstalk(object):
 
@@ -27,21 +26,44 @@ class Beanstalk(object):
         v.values = [value, ]
         v.dispatch()
 
-    def do_server_status(self):
-        conn = Connection(self.host, self.port)
-        srv_stats = conn.stats()
+    def yaml_parse(self, data):
+        lines = [l.split(": ") for l in data.split("\n")[1:]]
+        return dict([l for l in lines if len(l) == 2])
 
+    def tubes_parse(self, data):
+        return [l[2:] for l in data.split("\n")[1:] if len(l) > 2]
+        
+
+    def interact(self, cmd, expects):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect((self.host, self.port))
+        sock.sendall(cmd)
+        sock_file = sock.makefile('rb')
+        line = sock_file.readline()
+        if line:
+            status, result_len = line.split()
+            if expects.index(status) > -1:
+                body = sock_file.read(int(result_len))
+                sock_file.read(2)
+                return body
+        sock.close()
+
+    def do_server_status(self):
+        srv_stats = self.yaml_parse(self.interact('stats\r\n', ['OK']))
+        print "srv_stats: %r" % srv_stats
         for cmd in ('put', 'reserve-with-timeout', 'delete'):
             self.submit('counter', cmd, srv_stats['cmd-%s' % cmd])
         self.submit('counter', 'total_jobs', srv_stats['total-jobs'])
-        for tube in conn.tubes():
+        self.submit('gauge', 'current_tubes', srv_stats['current-tubes'])
+        self.submit('connections', 'connections', srv_stats['current-connections'])
+        
+        tubes = self.tubes_parse(self.interact('list-tubes\r\n', ['OK']))
+        for tube in tubes:
             for prefix in self.tubes_prefix:
                 if tube.startswith(prefix):
-                    tube_stats = conn.stats_tube(tube)
+                    tube_stats = self.yaml_parse(self.interact('stats-tube %s\r\n' % tube, ['OK']))
                     self.submit('records', 'current_ready', tube_stats['current-jobs-ready'], tube)
                     self.submit('counter', 'total_jobs', tube_stats['total-jobs'], tube)
-
-        conn.close()
 
     def config(self, obj):
         for node in obj.children:
